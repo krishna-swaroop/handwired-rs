@@ -3,3 +3,4 @@ node_modules/
 .DS_Store
 # The demo site that `bun run site:build` builds.
 site/
+/target/

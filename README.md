@@ -1,5 +1,7 @@
 # Handwired
 
+> **This fork** adds a Rust port of the runtime in [`crates/handwired`](crates/handwired), checked bit for bit against the TypeScript runtime.
+
 Turn your regular JavaScript code into a neural net; no training, exact, yet also fully differentiable!
 
 ## How It Works
