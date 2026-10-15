@@ -28,6 +28,7 @@
 pub mod cells;
 mod circuit;
 mod compile;
+mod domain;
 mod emit;
 pub mod fp;
 pub mod handwiredos;
@@ -41,8 +42,35 @@ mod validate;
 
 pub use circuit::*;
 pub use compile::*;
+pub use domain::*;
 pub use emit::*;
 pub use inline::*;
 pub use motion::*;
 pub use selection::*;
 pub use validate::*;
+
+/// Translates a function into the `Domain` vocabulary; see FRONTEND.md.
+///
+/// ```
+/// #[handwired::step]
+/// fn above(#[range(-100, 100)] a: i32) -> i32 {
+///     if a > 4 { 10 } else { 12 }
+/// }
+///
+/// let step = above_circuit();
+/// assert_eq!(step.circuit.evaluate_reference(&[5.0])[step.output.index()], 10.0);
+/// assert_eq!(above_in(&mut handwired::Native, 4.0), 12.0);
+/// ```
+///
+/// Anything outside the subset is a compile error, e.g. division:
+///
+/// ```compile_fail
+/// #[handwired::step]
+/// fn half(#[range(0, 10)] a: i32) -> i32 {
+///     a / 2
+/// }
+/// ```
+pub use handwired_macros::step;
+
+// Lets the macro's `::handwired` paths resolve inside this crate too.
+extern crate self as handwired;

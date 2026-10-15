@@ -6,6 +6,7 @@ license = "MIT"
 description = "Build exact, differentiable ReLU circuits from ordinary program logic. A Rust port of chenglou/handwired."
 
 [dependencies]
+handwired-macros = { path = "../handwired-macros" }
 
 [dev-dependencies]
 serde_json = "1"
