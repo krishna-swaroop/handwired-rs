@@ -7,9 +7,13 @@
 //
 //   node crates/handwired/conformance/generate.ts
 //
+// It also writes demos.json, the demo circuits of demos.ts, which
+// crates/handwired/tests/demos.rs checks.
+//
 // Plain Node 23.6+ runs this file directly; it needs no install.
 
 import {writeFileSync} from 'node:fs'
+import {demoFixtures} from './demos.ts'
 import {
   Circuit,
   describeFirstNaN,
@@ -727,3 +731,8 @@ for (const [name, scenario] of Object.entries(scenarios)) {
 const path = new URL('./fixtures.json', import.meta.url)
 writeFileSync(path, JSON.stringify(output))
 console.log(`wrote ${Object.keys(output).length} scenarios to ${path.pathname}`)
+
+// The demo circuits of HandwiredOS and JSON search, see demos.ts.
+const demosPath = new URL('./demos.json', import.meta.url)
+writeFileSync(demosPath, JSON.stringify(demoFixtures()))
+console.log(`wrote the demo circuits to ${demosPath.pathname}`)

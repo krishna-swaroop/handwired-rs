@@ -25,12 +25,17 @@
 // Index loops keep the ported code line-for-line comparable with the TypeScript runtime.
 #![allow(clippy::needless_range_loop)]
 
+pub mod cells;
 mod circuit;
 mod compile;
 mod emit;
 pub mod fp;
+pub mod handwiredos;
+pub mod host_timing;
 mod inline;
+pub mod json_search;
 mod motion;
+pub mod prefix;
 mod selection;
 mod validate;
 

@@ -417,6 +417,12 @@ impl Circuit {
         self.append(AtomKind::Reglu, left_terms.to_vec(), left_bias, gate_terms.to_vec(), gate_bias, false, None)
     }
 
+    /// The ReGLU atom kept as written: `append('reglu', ..., {preserveRounding: true})`
+    /// in the TypeScript runtime. No term is normalized, folded or composed.
+    pub fn reglu_preserving(&mut self, left_terms: &[Term], left_bias: f64, gate_terms: &[Term], gate_bias: f64) -> Wire {
+        self.append(AtomKind::Reglu, left_terms.to_vec(), left_bias, gate_terms.to_vec(), gate_bias, true, None)
+    }
+
     /// Round a score within 0..1 at 0.5: below becomes 0, the rest 1.
     pub fn boolean(&mut self, value: Wire) -> Wire {
         let range = self.ranges[value.index()];

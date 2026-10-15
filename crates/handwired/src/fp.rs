@@ -21,6 +21,17 @@ pub fn relu_js(x: f64) -> f64 {
     }
 }
 
+/// `Math.round(x)`: the nearest whole number, halves rounded up toward
+/// +Infinity, and -0 for values within -0.5..-0.
+pub fn js_round(x: f64) -> f64 {
+    if !x.is_finite() {
+        return x;
+    }
+    let floor = x.floor();
+    let rounded = if x - floor >= 0.5 { floor + 1.0 } else { floor };
+    if rounded == 0.0 && (x < 0.0 || (x == 0.0 && x.is_sign_negative())) { -0.0 } else { rounded }
+}
+
 /// 2^exponent for exponents within the normal f64 range, built from bits so
 /// it's exact.
 pub fn pow2(exponent: i32) -> f64 {

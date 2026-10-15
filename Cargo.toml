@@ -1,3 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/handwired"]
+
+# The demo parity tests run the demo circuits over thousands of evaluations,
+# which takes minutes unoptimized.
+[profile.test]
+opt-level = 2
