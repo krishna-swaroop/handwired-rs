@@ -102,22 +102,99 @@ pub struct TensorWorkspace {
     /// After an evaluation, `packed_values[i]` is the value of wire
     /// `program.wire_order[i]`.
     pub packed_values: Vec<f32>,
-    input: Vec<f32>,
-    projection: Vec<f32>,
+    plans: Vec<LayerPlan>,
+    /// A layer's gate and index rows; its output rows go straight to
+    /// `packed_values`.
+    scratch: Vec<f32>,
     gather_indices: Vec<i32>,
     gather_masses: Vec<f32>,
 }
 
 impl TensorWorkspace {
     pub fn new(program: &TensorProgram) -> TensorWorkspace {
-        let projection = program.layers.iter().map(|layer| layer.bias.len()).max().unwrap_or(0);
-        let input = program.layers.iter().map(|layer| layer.input_size).max().unwrap_or(0);
+        let scratch = program.layers.iter().map(|layer| layer.bias.len() - layer.output_size).max().unwrap_or(0);
+        let plans = program.layers.iter().map(LayerPlan::new).collect();
         TensorWorkspace {
             packed_values: vec![0.0; program.value_count],
-            input: vec![0.0; input],
-            projection: vec![0.0; projection],
+            plans,
+            scratch: vec![0.0; scratch],
             gather_indices: vec![0; program.gather_slot_count],
             gather_masses: vec![0.0; program.gather_slot_count],
+        }
+    }
+}
+
+// A layer's projection rows, read straight from the packed values. Rows of
+// one layer are independent, so they run grouped by shape: a single-term row
+// as one flat entry, the others with their terms. Output rows land in the
+// layer's packed values, gate and index rows in the scratch rows.
+#[derive(Clone, Debug, Default)]
+struct LayerPlan {
+    output_singles: Vec<SingleRow>,
+    output_rows: Vec<MultiRow>,
+    scratch_singles: Vec<SingleRow>,
+    scratch_rows: Vec<MultiRow>,
+    /// (packed position, weight) of every multi-term row.
+    terms: Vec<(u32, f32)>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct SingleRow {
+    row: u32,
+    column: u32,
+    weight: f32,
+    bias: f32,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct MultiRow {
+    row: u32,
+    bias: f32,
+    start: u32,
+    end: u32,
+}
+
+impl LayerPlan {
+    fn new(layer: &TensorLayer) -> LayerPlan {
+        let mut plan = LayerPlan::default();
+        for row in 0..layer.bias.len() {
+            let (start, end) = (layer.row_offsets[row] as usize, layer.row_offsets[row + 1] as usize);
+            let is_output = row < layer.output_size;
+            let row_index = if is_output { row } else { row - layer.output_size } as u32;
+            let bias = layer.bias[row];
+            if end - start == 1 {
+                let single = SingleRow {
+                    row: row_index,
+                    column: layer.input_indices[layer.columns[start] as usize],
+                    weight: layer.weights[start],
+                    bias,
+                };
+                if is_output { plan.output_singles.push(single) } else { plan.scratch_singles.push(single) }
+            } else {
+                let term_start = plan.terms.len() as u32;
+                for index in start..end {
+                    plan.terms.push((layer.input_indices[layer.columns[index] as usize], layer.weights[index]));
+                }
+                let multi = MultiRow { row: row_index, bias, start: term_start, end: plan.terms.len() as u32 };
+                if is_output { plan.output_rows.push(multi) } else { plan.scratch_rows.push(multi) }
+            }
+        }
+        plan
+    }
+
+    // value = bias + w0 x0 + w1 x1 + ..., in FP32, in the program's term order.
+    fn run(&self, earlier: &[f32], outputs: &mut [f32], scratch: &mut [f32]) {
+        for (singles, rows, target) in [(&self.output_singles, &self.output_rows, outputs), (&self.scratch_singles, &self.scratch_rows, scratch)] {
+            for single in singles {
+                target[single.row as usize] = single.bias + single.weight * earlier[single.column as usize];
+            }
+            for row in rows {
+                let mut value = row.bias;
+                for &(column, weight) in &self.terms[row.start as usize..row.end as usize] {
+                    value += weight * earlier[column as usize];
+                }
+                target[row.row as usize] = value;
+            }
         }
     }
 }
@@ -136,7 +213,40 @@ impl TensorEvaluator {
     /// The roots' values. The returned slice is overwritten on the next call.
     pub fn evaluate(&mut self, source: &[f32]) -> &[f32] {
         validate_source(&self.source_ranges, source);
-        execute_tensor_program(source, &self.program, &mut self.workspace);
+        self.workspace.packed_values[..source.len()].copy_from_slice(source);
+        self.evaluate_current()
+    }
+
+    /// Write one source cell for `evaluate_current`, checked against its range.
+    pub fn set_source(&mut self, wire: usize, value: f32) {
+        let range = self.source_ranges[wire];
+        if !(value as f64 >= range.minimum && value as f64 <= range.maximum) {
+            panic!("source wire {wire} is outside its assumed range");
+        }
+        self.workspace.packed_values[wire] = value;
+    }
+
+    /// Write source cells for `evaluate_current` without checking them, e.g.
+    /// cells that `set_source` overwrites before the next evaluation.
+    pub fn set_source_unchecked(&mut self, start: usize, values: &[f32]) {
+        self.workspace.packed_values[start..start + values.len()].copy_from_slice(values);
+    }
+
+    /// Check the source cells already written, e.g. after `set_source_unchecked`.
+    pub fn check_source(&self, wires: impl IntoIterator<Item = usize>) {
+        for wire in wires {
+            let value = self.workspace.packed_values[wire] as f64;
+            let range = self.source_ranges[wire];
+            if !(value >= range.minimum && value <= range.maximum) {
+                panic!("source wire {wire} is outside its assumed range");
+            }
+        }
+    }
+
+    /// The roots' values for the source cells written so far, e.g. by a host
+    /// that changes a few cells of a large source table between evaluations.
+    pub fn evaluate_current(&mut self) -> &[f32] {
+        run_layers(&self.program, &mut self.workspace);
         for (output, &position) in self.outputs.iter_mut().zip(&self.positions) {
             *output = self.workspace.packed_values[position];
         }
@@ -733,29 +843,28 @@ fn attempt_gather_match(
 /// Run a compiled program on one source table into the workspace.
 pub fn execute_tensor_program(source: &[f32], program: &TensorProgram, workspace: &mut TensorWorkspace) {
     assert!(source.len() == program.source_size, "source table has the wrong length");
-    let TensorWorkspace { packed_values, input, projection, gather_indices, gather_masses } = workspace;
-    packed_values[..source.len()].copy_from_slice(source);
-    let mut available = source.len();
-    for layer in &program.layers {
+    workspace.packed_values[..source.len()].copy_from_slice(source);
+    run_layers(program, workspace);
+}
+
+// The layers on the source cells already in `packed_values`. A layer only reads
+// values before its own, so its output rows are computed in place.
+fn run_layers(program: &TensorProgram, workspace: &mut TensorWorkspace) {
+    let TensorWorkspace { packed_values, plans, scratch, gather_indices, gather_masses } = workspace;
+    let mut available = program.source_size;
+    for (layer, plan) in program.layers.iter().zip(plans.iter()) {
         let output_size = layer.output_size;
-        for (column, &index) in layer.input_indices.iter().enumerate() {
-            input[column] = packed_values[index as usize];
-        }
-        for row in 0..layer.bias.len() {
-            let mut value = layer.bias[row];
-            for index in layer.row_offsets[row] as usize..layer.row_offsets[row + 1] as usize {
-                let product = layer.weights[index] * input[layer.columns[index] as usize];
-                value += product;
-            }
-            projection[row] = value;
-        }
+        let (earlier, rest) = packed_values.split_at_mut(available);
+        let outputs = &mut rest[..output_size];
+        let earlier = &*earlier;
+        plan.run(earlier, outputs, scratch);
         if !layer.gather_reads.is_empty() {
             for compute in &layer.gather_computes {
                 // The dot of exact 0/1 bits with 0..N-1 is an exact small integer.
                 let mut index = 0f64;
                 let mut mass = 0f64;
                 for (position, &bit_position) in compute.bit_positions.iter().enumerate() {
-                    let bit = packed_values[bit_position as usize] as f64;
+                    let bit = earlier[bit_position as usize] as f64;
                     index += position as f64 * bit;
                     mass += bit;
                 }
@@ -767,23 +876,23 @@ pub fn execute_tensor_program(source: &[f32], program: &TensorProgram, workspace
                 // instead of reading out of bounds.
                 let limit = read.candidate_positions.len() as i32 - 1;
                 let index = gather_indices[read.slot].max(0).min(limit);
-                let mut contribution = packed_values[read.candidate_positions[index as usize] as usize];
+                let mut contribution = earlier[read.candidate_positions[index as usize] as usize];
                 if read.masked {
                     contribution *= gather_masses[read.slot];
                 }
-                projection[read.row] += contribution;
+                *row_mut(outputs, scratch, read.row) += contribution;
             }
         }
         for read in &layer.index_reads {
-            let position =
-                resolve_index_position(projection[read.index_row] as f64, read.candidate_count, read.below_zero, read.above_zero);
-            projection[read.row] = if position >= 0 {
+            let index = *row_mut(outputs, scratch, read.index_row);
+            let position = resolve_index_position(index as f64, read.candidate_count, read.below_zero, read.above_zero);
+            *row_mut(outputs, scratch, read.row) = if position >= 0 {
                 let packed = if read.candidate_positions.is_empty() {
                     (read.candidate_base + position * read.candidate_stride) as usize
                 } else {
                     read.candidate_positions[position as usize] as usize
                 };
-                packed_values[packed]
+                earlier[packed]
             } else if position == -1 {
                 0.0
             } else {
@@ -791,17 +900,23 @@ pub fn execute_tensor_program(source: &[f32], program: &TensorProgram, workspace
             };
         }
         for (gate_row, &output_row) in layer.gate_rows.iter().enumerate() {
-            let output_row = output_row as usize;
-            projection[output_row] =
-                (projection[output_row] as f64 * relu_js(projection[output_size + gate_row] as f64)) as f32;
+            let gate = scratch[gate_row] as f64;
+            let output = row_mut(outputs, scratch, output_row as usize);
+            *output = (*output as f64 * relu_js(gate)) as f32;
         }
         for &boolean_row in &layer.boolean_rows {
-            let boolean_row = boolean_row as usize;
-            projection[boolean_row] = evaluate_boolean(projection[boolean_row] as f64) as f32;
+            let value = row_mut(outputs, scratch, boolean_row as usize);
+            *value = evaluate_boolean(*value as f64) as f32;
         }
-        packed_values[available..available + output_size].copy_from_slice(&projection[..output_size]);
         available += output_size;
     }
+}
+
+// A projection row: an output row in the layer's packed values, or a gate or
+// index row in the scratch rows after them.
+fn row_mut<'a>(outputs: &'a mut [f32], scratch: &'a mut [f32], row: usize) -> &'a mut f32 {
+    let output_size = outputs.len();
+    if row < output_size { &mut outputs[row] } else { &mut scratch[row - output_size] }
 }
 
 // JavaScript's ToInt32, which an Int32Array store applies.

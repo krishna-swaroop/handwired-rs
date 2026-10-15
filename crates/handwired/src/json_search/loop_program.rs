@@ -186,7 +186,10 @@ pub fn operations_per_document(program: &LoopProgram) -> usize {
 
 struct StageRunner {
     evaluator: crate::compile::TensorEvaluator,
-    values: Vec<f32>,
+    /// The source cells no binding writes, which hold shared values and are
+    /// checked once after `set_shared` instead of on every step.
+    unbound: Vec<usize>,
+    unbound_checked: bool,
     items: Vec<(usize, usize)>,
     cells: Vec<(usize, usize, usize)>,
     registers: Vec<(usize, usize)>,
@@ -218,7 +221,8 @@ impl<'a> LoopRunner<'a> {
                     .collect();
                 let mut runner = StageRunner {
                     evaluator,
-                    values: vec![0.0; stage.program.source_size],
+                    unbound: Vec::new(),
+                    unbound_checked: false,
                     items: Vec::new(),
                     cells: Vec::new(),
                     registers: Vec::new(),
@@ -234,6 +238,11 @@ impl<'a> LoopRunner<'a> {
                         Binding::Field { field, component } => runner.fields.push((position, field, component)),
                     }
                 }
+                let mut bound = vec![false; stage.program.source_size];
+                for &(wire, _) in &stage.bindings {
+                    bound[wire.index()] = true;
+                }
+                runner.unbound = (0..bound.len()).filter(|&wire| !bound[wire]).collect();
                 runner
             })
             .collect();
@@ -252,7 +261,8 @@ impl<'a> LoopRunner<'a> {
         assert!(shared.len() == self.program.shared_values.len(), "the shared values have the loop program's length");
         for (runner, stage) in self.stages.iter_mut().zip(&self.program.stages) {
             let size = stage.program.source_size;
-            runner.values.copy_from_slice(&shared[stage.shared_offset..stage.shared_offset + size]);
+            runner.evaluator.set_source_unchecked(0, &shared[stage.shared_offset..stage.shared_offset + size]);
+            runner.unbound_checked = false;
         }
     }
 
@@ -271,22 +281,26 @@ impl<'a> LoopRunner<'a> {
             Some((buffer, column)) => (positions as f64).min(buffers[buffer][bases[buffer] + column] as f64) as usize,
         };
         for (runner, stage) in self.stages.iter_mut().zip(&program.stages) {
+            if !runner.unbound_checked {
+                runner.evaluator.check_source(runner.unbound.iter().copied());
+                runner.unbound_checked = true;
+            }
             for &(position, buffer, column) in &runner.cells {
-                runner.values[position] = buffers[buffer][bases[buffer] + column];
+                runner.evaluator.set_source(position, buffers[buffer][bases[buffer] + column]);
             }
             let count = if stage.repeat == Repeat::Once { 1 } else { limit };
             for step in 0..count {
                 let position = if stage.repeat == Repeat::Backward { limit - 1 - step } else { step };
                 for &(at, buffer) in &runner.items {
-                    runner.values[at] = buffers[buffer][bases[buffer] + position];
+                    runner.evaluator.set_source(at, buffers[buffer][bases[buffer] + position]);
                 }
                 for &(at, register) in &runner.registers {
-                    runner.values[at] = self.registers[register];
+                    runner.evaluator.set_source(at, self.registers[register]);
                 }
                 for &(at, field, component) in &runner.fields {
-                    runner.values[at] = self.fields[field][position * program.fields[field].width + component];
+                    runner.evaluator.set_source(at, self.fields[field][position * program.fields[field].width + component]);
                 }
-                let computed = runner.evaluator.evaluate(&runner.values);
+                let computed = runner.evaluator.evaluate_current();
                 for &(at, write) in &runner.writes {
                     let value = computed[at];
                     match write {
